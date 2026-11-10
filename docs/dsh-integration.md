@@ -117,6 +117,44 @@ sudo systemctl enable --now codex-taskboard
 journalctl -u codex-taskboard -f
 ```
 
+## Stop or restart the service
+
+Foreground (`npm start` in a terminal): press `Ctrl+C`; the server closes gracefully and
+releases port 47823.
+
+Background/persistent start (`(cd ~/github/dashi-taskboard && npm start > /tmp/… &)`): the
+process tree is `npm start` → `sh -c node server/index.mjs` → `node server/index.mjs`, and the
+whole subtree is reparented to init. Stop the **node** process, not the `sh` wrapper:
+
+```bash
+# 1) find the process holding the port
+ss -ltnp | grep 47823            # users:(("node",pid=NNN,fd=24))
+# or
+pgrep -af "github/dashi-taskboard/server/index.mjs"
+
+# 2) graceful stop (the server handles SIGTERM)
+kill <node-pid>
+# or in one step
+pkill -f "github/dashi-taskboard/server/index.mjs"
+
+# 3) wait until the port is free before starting again
+until ! curl -fsS -o /dev/null http://127.0.0.1:47823/; do sleep 0.25; done
+ss -ltnp | grep 47823 || echo "port free"
+```
+
+Notes:
+
+- Kill the `node` PID, not the `sh -c` wrapper: killing the wrapper first leaves `node`
+  holding the port as an orphan and the next start fails with `EADDRINUSE`.
+  `kill <node-pid>` makes the wrapper exit on its own.
+- `fuser -k 47823/tcp` also works but is less precise; prefer SIGTERM, keep `kill -9` as a
+  last resort (SIGTERM closes the SQLite connection cleanly).
+- Restarting = stop, then run the background start command again; the log stays at
+  `/tmp/dashi-taskboard.log`.
+- With the systemd unit, use `sudo systemctl stop codex-taskboard` /
+  `sudo systemctl restart codex-taskboard`. Do not `kill` it by hand: `Restart=on-failure`
+  starts it again.
+
 ## Data directory
 
 The service keeps its SQLite database, cloud companion config and attachments in
@@ -151,7 +189,11 @@ uses it:
   error instead of failing silently;
 - every delivered issue instruction carries the host rule: when the issue needs user
   confirmation, move it to `blocked` and comment what is being waited on (only delivered
-  work goes to `in_review`).
+  work goes to `in_review`);
+- the issue composer's `@` menu adds two separate context groups — **DSH files & folders**
+  and **DSH conversations** — fed by the plugin bridge; selected conversation mentions are
+  replayed into the execution prompt as referenced context, while file mentions stay as
+  readable paths for the agent.
 
 ## Verify the integration
 

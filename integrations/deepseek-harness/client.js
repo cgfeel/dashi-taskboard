@@ -25,6 +25,43 @@ window.__ModuleLoader__.load({
       return `${text}\n\n${HOST_INSTRUCTION_RULE}`;
     }
 
+
+    // Canonical DSH session mentions encode the session id as base64url(JSON string);
+    // an older build of this bridge wrote the raw id into the URI, which the host
+    // rejects when it prepares references. Both directions are handled here.
+    function base64UrlEncode(text) {
+      const bytes = new TextEncoder().encode(text);
+      let binary = "";
+      for (const byte of bytes) binary += String.fromCharCode(byte);
+      return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/u, "");
+    }
+
+    function base64UrlDecode(value) {
+      const padded = value.replaceAll("-", "+").replaceAll("_", "/")
+        .padEnd(Math.ceil(value.length / 4) * 4, "=");
+      const binary = atob(padded);
+      const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+      return new TextDecoder().decode(bytes);
+    }
+
+    function sessionReferenceMention(sessionId, label) {
+      const uri = `dsh-session:${base64UrlEncode(JSON.stringify(sessionId))}`;
+      return `@[${String(label).replace(/[\\\]]/gu, (character) => `\\${character}`)}](${uri})`;
+    }
+
+    function normalizeReferenceMention(reference) {
+      const match = /^@\[((?:\\.|[^\\\]])*)\]\(dsh-session:([^\s)]*)\)$/u.exec(reference.trim());
+      if (!match) return reference;
+      const [, , payload] = match;
+      try {
+        const decoded = JSON.parse(base64UrlDecode(payload));
+        if (typeof decoded === "string") return reference;
+      } catch {
+        // Not canonical: repair the raw session id written by earlier builds.
+      }
+      return `@[${match[1]}](dsh-session:${base64UrlEncode(JSON.stringify(payload))})`;
+    }
+
     const CSS = `
 .dsh-codex-taskboard-trigger{box-sizing:border-box;display:flex;align-items:center;gap:8px;width:calc(100% + 8px);height:34px;margin:4px -4px;padding:6px 2px 6px 10px;border:0;border-radius:12px;background:transparent;color:var(--dsw-alias-label-primary);cursor:pointer;font:inherit;overflow:hidden}
 .dsh-codex-taskboard-trigger:hover{background:var(--dsw-alias-interactive-bg-hover)}
@@ -200,7 +237,7 @@ window.__ModuleLoader__.load({
       );
     }
 
-    const inject = ["slots", "sessions", "workspaces"];
+    const inject = ["slots", "sessions", "workspaces", "remote", "remote.fileReferences", "remote.sessionReferenceResolver"];
 
     function apply(ctx) {
       ctx.effect(() => {
@@ -295,6 +332,98 @@ window.__ModuleLoader__.load({
           }
         };
 
+        // Issue composer context menu: DSH files/folders and conversations are
+        // returned as two separated candidate groups.
+        if (message.type === "taskboard:reference-candidates") {
+          const requestId = typeof message.payload?.requestId === "string"
+            ? message.payload.requestId
+            : "";
+          const query = typeof message.payload?.query === "string"
+            ? message.payload.query
+            : "";
+          if (!requestId) return;
+          const empty = () => reply("taskboard:reference-candidates-response", {
+            requestId,
+            files: [],
+            sessions: [],
+          });
+          const snapshot = sessions?.list?.getSnapshot?.();
+          const current = Object.values(snapshot?.byId ?? {}).find(
+            (candidate) => (candidate?.retainedBy?.mainView ?? 0) > 0,
+          );
+          if (!current?.id) {
+            empty();
+            return;
+          }
+          let remote;
+          try {
+            remote = ctx.remote ?? ctx.get?.("remote");
+          } catch {
+            remote = undefined;
+          }
+          const fileList = remote?.fileReferences?.list;
+          const sessionCandidates = remote?.sessionReferenceResolver?.candidates;
+          const controller = new AbortController();
+          const abortTimer = setTimeout(() => controller.abort(), 3_000);
+          let files = [];
+          let conversations = [];
+          try {
+            const [fileResult, sessionResult] = await Promise.all([
+              typeof fileList === "function"
+                ? fileList.call(remote.fileReferences, current.id, query, controller.signal)
+                : Promise.resolve(null),
+              typeof sessionCandidates === "function"
+                ? sessionCandidates.call(remote.sessionReferenceResolver, current.id, query, controller.signal)
+                : Promise.resolve(null),
+            ]);
+            const fileValue = Array.isArray(fileResult?.ok ? fileResult.value : null)
+              ? fileResult.value
+              : [];
+            const sessionValue = Array.isArray(sessionResult?.ok ? sessionResult.value : null)
+              ? sessionResult.value
+              : [];
+            files = fileValue.flatMap((candidate) => {
+              const path = typeof candidate?.path === "string" ? candidate.path : "";
+              if (!path) return [];
+              const directory = candidate?.kind === "directory";
+              const mention = /\s/u.test(path)
+                ? (directory ? `@"${path}/` : `@"${path}"`)
+                : `@${path}${directory ? "/" : ""}`;
+              return [{
+                kind: directory ? "directory" : "file",
+                label: directory ? `${path}/` : path,
+                mention,
+              }];
+            });
+            conversations = sessionValue.flatMap((candidate) => {
+              const sessionId = typeof candidate?.sessionId === "string" ? candidate.sessionId : "";
+              if (!sessionId || sessionId === current.id) return [];
+              const label = String(candidate.displayTitle ?? candidate.label ?? sessionId);
+              const mention = typeof candidate.mention === "string" && candidate.mention.startsWith("@[")
+                ? candidate.mention
+                : sessionReferenceMention(sessionId, label);
+              return [{ kind: "session", label, mention }];
+            });
+          } catch (error) {
+            console.warn("[codex-taskboard] reference candidates failed:", error);
+          } finally {
+            clearTimeout(abortTimer);
+          }
+          if (files.length === 0 && conversations.length === 0) {
+            console.warn("[codex-taskboard] no DSH context candidates", {
+              hasRemote: Boolean(remote),
+              hasFileList: typeof fileList === "function",
+              hasSessionCandidates: typeof sessionCandidates === "function",
+            });
+          }
+          reply("taskboard:reference-candidates-response", {
+            requestId,
+            files,
+            sessions: conversations,
+          });
+          return;
+        }
+
         // Conversation bubble / comment "View conversation": reopen the bound
         // Session for reading only; the issue prompt is not re-sent.
         if (message.type === "taskboard:open-thread") {
@@ -334,12 +463,20 @@ window.__ModuleLoader__.load({
             ? message.payload.instruction
             : "",
         );
+        const references = Array.isArray(message.payload?.references)
+          ? message.payload.references.filter(
+              (reference) => typeof reference === "string" && reference.trim() !== "",
+            ).map(normalizeReferenceMention)
+          : [];
+        const issueInstruction = references.length > 0
+          ? `${instruction}\n\nReferenced context selected on the issue:\n${references.join("\n")}`
+          : instruction;
         const boundThreadId = typeof message.payload?.threadId === "string"
           ? message.payload.threadId.trim()
           : "";
         if (boundThreadId) {
           try {
-            await resumeTaskboardSession(boundThreadId, instruction);
+            await resumeTaskboardSession(boundThreadId, issueInstruction);
             reply("taskboard:thread-prepared", {});
             closeTaskboardPanels();
           } catch (error) {
@@ -355,7 +492,7 @@ window.__ModuleLoader__.load({
           return;
         }
         try {
-          await openTaskboardSession(workspacePath, instruction);
+          await openTaskboardSession(workspacePath, issueInstruction);
           reply("taskboard:thread-prepared", {});
           closeTaskboardPanels();
         } catch (error) {

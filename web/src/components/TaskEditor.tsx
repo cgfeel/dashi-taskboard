@@ -47,7 +47,11 @@ import {
   type PendingInlineAttachment,
   type PendingInlineImage,
 } from "../documentModel";
-import { InlineMediaComposer, type InlineMediaComposerHandle } from "./InlineMediaComposer";
+import {
+  InlineMediaComposer,
+  type HostReferenceCandidateGroups,
+  type InlineMediaComposerHandle,
+} from "./InlineMediaComposer";
 import { TaskPropertyPicker } from "./TaskPropertyPicker";
 import { TaskboardIcon } from "./TaskboardIcon";
 
@@ -106,6 +110,7 @@ interface TaskEditorProps {
   currentUser: ActorIdentity;
   developmentScan: DevelopmentScan;
   developmentScanLoading: boolean;
+  onHostReferenceCandidates?: (query: string) => Promise<HostReferenceCandidateGroups>;
   onCreateLabel: (label: string) => Promise<void>;
   onCancel: (draft: NewTaskEditorDraft | null) => void;
   onSave: (
@@ -164,6 +169,7 @@ export function TaskEditor({
   currentUser,
   developmentScan,
   developmentScanLoading,
+  onHostReferenceCandidates,
   onCreateLabel,
   onCancel,
   onSave,
@@ -520,6 +526,7 @@ export function TaskEditor({
             mentionTasks={tasks}
             referenceTasks={referenceTasks}
             completionContext={projectId ? { projectId, surface: "issue-description" } : undefined}
+            onHostReferenceCandidates={onHostReferenceCandidates}
             placeholder={text("添加描述…", "Add description…")}
             ariaLabel={text("描述", "Description")}
             disabled={saving}

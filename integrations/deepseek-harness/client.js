@@ -295,6 +295,88 @@ window.__ModuleLoader__.load({
           }
         };
 
+        // Issue composer context menu: DSH files/folders and conversations are
+        // returned as two separated candidate groups.
+        if (message.type === "taskboard:reference-candidates") {
+          const requestId = typeof message.payload?.requestId === "string"
+            ? message.payload.requestId
+            : "";
+          const query = typeof message.payload?.query === "string"
+            ? message.payload.query
+            : "";
+          if (!requestId) return;
+          const empty = () => reply("taskboard:reference-candidates-response", {
+            requestId,
+            files: [],
+            sessions: [],
+          });
+          const snapshot = sessions?.list?.getSnapshot?.();
+          const current = Object.values(snapshot?.byId ?? {}).find(
+            (candidate) => (candidate?.retainedBy?.mainView ?? 0) > 0,
+          );
+          if (!current?.id) {
+            empty();
+            return;
+          }
+          let remote;
+          try {
+            remote = ctx.get?.("remote");
+          } catch {
+            remote = undefined;
+          }
+          const fileList = remote?.fileReferences?.list;
+          const sessionCandidates = remote?.sessionReferenceResolver?.candidates;
+          let files = [];
+          let conversations = [];
+          try {
+            const [fileResult, sessionResult] = await Promise.all([
+              typeof fileList === "function"
+                ? fileList.call(remote.fileReferences, current.id, query, undefined)
+                : Promise.resolve(null),
+              typeof sessionCandidates === "function"
+                ? sessionCandidates.call(remote.sessionReferenceResolver, current.id, query, undefined)
+                : Promise.resolve(null),
+            ]);
+            const fileValue = Array.isArray(fileResult?.ok ? fileResult.value : null)
+              ? fileResult.value
+              : [];
+            const sessionValue = Array.isArray(sessionResult?.ok ? sessionResult.value : null)
+              ? sessionResult.value
+              : [];
+            files = fileValue.flatMap((candidate) => {
+              const path = typeof candidate?.path === "string" ? candidate.path : "";
+              if (!path) return [];
+              const directory = candidate?.kind === "directory";
+              const mention = /\s/u.test(path)
+                ? (directory ? `@"${path}/` : `@"${path}"`)
+                : `@${path}${directory ? "/" : ""}`;
+              return [{
+                kind: directory ? "directory" : "file",
+                label: directory ? `${path}/` : path,
+                mention,
+              }];
+            });
+            conversations = sessionValue.flatMap((candidate) => {
+              const sessionId = typeof candidate?.sessionId === "string" ? candidate.sessionId : "";
+              if (!sessionId || sessionId === current.id) return [];
+              const label = String(candidate.displayTitle ?? candidate.label ?? sessionId);
+              return [{
+                kind: "session",
+                label,
+                mention: `@[${label.replaceAll("]", "\\]")}](dsh-session:${sessionId})`,
+              }];
+            });
+          } catch (error) {
+            console.error("[codex-taskboard] reference candidates failed:", error);
+          }
+          reply("taskboard:reference-candidates-response", {
+            requestId,
+            files,
+            sessions: conversations,
+          });
+          return;
+        }
+
         // Conversation bubble / comment "View conversation": reopen the bound
         // Session for reading only; the issue prompt is not re-sent.
         if (message.type === "taskboard:open-thread") {
@@ -334,12 +416,20 @@ window.__ModuleLoader__.load({
             ? message.payload.instruction
             : "",
         );
+        const references = Array.isArray(message.payload?.references)
+          ? message.payload.references.filter(
+              (reference) => typeof reference === "string" && reference.trim() !== "",
+            )
+          : [];
+        const issueInstruction = references.length > 0
+          ? `${instruction}\n\nReferenced context selected on the issue:\n${references.join("\n")}`
+          : instruction;
         const boundThreadId = typeof message.payload?.threadId === "string"
           ? message.payload.threadId.trim()
           : "";
         if (boundThreadId) {
           try {
-            await resumeTaskboardSession(boundThreadId, instruction);
+            await resumeTaskboardSession(boundThreadId, issueInstruction);
             reply("taskboard:thread-prepared", {});
             closeTaskboardPanels();
           } catch (error) {
@@ -355,7 +445,7 @@ window.__ModuleLoader__.load({
           return;
         }
         try {
-          await openTaskboardSession(workspacePath, instruction);
+          await openTaskboardSession(workspacePath, issueInstruction);
           reply("taskboard:thread-prepared", {});
           closeTaskboardPanels();
         } catch (error) {

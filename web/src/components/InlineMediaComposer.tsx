@@ -104,11 +104,23 @@ export interface InlineMediaCompletionContext {
   surface: Exclude<ComposerSurface, "ai-chat">;
 }
 
+export interface HostReferenceCandidate {
+  kind: "file" | "directory" | "session";
+  label: string;
+  mention: string;
+}
+
+export interface HostReferenceCandidateGroups {
+  files: readonly HostReferenceCandidate[];
+  sessions: readonly HostReferenceCandidate[];
+}
+
 export interface InlineMediaComposerProps {
   segments: InlineMediaSegment[];
   mentionTasks?: readonly Task[];
   referenceTasks: readonly Task[];
   completionContext?: InlineMediaCompletionContext;
+  onHostReferenceCandidates?: (query: string) => Promise<HostReferenceCandidateGroups>;
   placeholder: string;
   ariaLabel: string;
   disabled?: boolean;
@@ -130,12 +142,17 @@ interface ComposerQuery {
 
 type CompletionSelection =
   | { type: "candidate"; candidate: ComposerCandidate }
+  | { type: "host"; reference: HostReferenceCandidate }
   | { type: "issue"; task: Task };
 
 function completionSelectionId(selection: CompletionSelection): string {
-  return selection.type === "candidate"
-    ? `candidate:${selection.candidate.kind}:${selection.candidate.candidateRef}`
-    : `issue:${selection.task.id}`;
+  if (selection.type === "candidate") {
+    return `candidate:${selection.candidate.kind}:${selection.candidate.candidateRef}`;
+  }
+  if (selection.type === "host") {
+    return `host:${selection.reference.kind}:${selection.reference.mention}`;
+  }
+  return `issue:${selection.task.id}`;
 }
 
 function PendingImageBlock({
@@ -1104,6 +1121,7 @@ export const InlineMediaComposer = forwardRef<InlineMediaComposerHandle, InlineM
     mentionTasks = EMPTY_MENTION_TASKS,
     referenceTasks,
     completionContext,
+    onHostReferenceCandidates,
     placeholder,
     ariaLabel,
     disabled = false,
@@ -1127,6 +1145,7 @@ export const InlineMediaComposer = forwardRef<InlineMediaComposerHandle, InlineM
     const mentionTasksRef = useRef(mentionTasks);
     const referenceTasksRef = useRef(referenceTasks);
     const completionContextRef = useRef(completionContext);
+    const hostReferenceRequestRef = useRef(onHostReferenceCandidates);
     const onChangeRef = useRef(onChange);
     const onErrorRef = useRef(onError);
     const onKeyDownRef = useRef(onKeyDown);
@@ -1140,12 +1159,14 @@ export const InlineMediaComposer = forwardRef<InlineMediaComposerHandle, InlineM
     const [completionResponse, setCompletionResponse] = useState<ComposerCandidatesResponse | null>(null);
     const [completionLoading, setCompletionLoading] = useState(false);
     const [completionError, setCompletionError] = useState<string | null>(null);
+    const [hostReferenceGroups, setHostReferenceGroups] = useState<HostReferenceCandidateGroups | null>(null);
 
     disabledRef.current = disabled;
     allowAttachmentsRef.current = allowAttachments;
     mentionTasksRef.current = mentionTasks;
     referenceTasksRef.current = referenceTasks;
     completionContextRef.current = completionContext;
+    hostReferenceRequestRef.current = onHostReferenceCandidates;
     onChangeRef.current = onChange;
     onErrorRef.current = onError;
     onKeyDownRef.current = onKeyDown;
@@ -1172,11 +1193,22 @@ export const InlineMediaComposer = forwardRef<InlineMediaComposerHandle, InlineM
           && Boolean(candidate.persistence.referenceKey)
           && Boolean(candidate.persistence.markdown);
       }) ?? [];
+      const hostSelections: CompletionSelection[] = completionQuery?.trigger === "@"
+        ? [
+            ...(hostReferenceGroups?.files ?? []).map(
+              (reference): CompletionSelection => ({ type: "host", reference }),
+            ),
+            ...(hostReferenceGroups?.sessions ?? []).map(
+              (reference): CompletionSelection => ({ type: "host", reference }),
+            ),
+          ]
+        : [];
       return [
         ...issueResults.map((task): CompletionSelection => ({ type: "issue", task })),
+        ...hostSelections,
         ...candidates.map((candidate): CompletionSelection => ({ type: "candidate", candidate })),
       ];
-    }, [completionQuery?.trigger, completionResponse, issueResults]);
+    }, [completionQuery?.trigger, completionResponse, hostReferenceGroups, issueResults]);
 
     const selectedCompletionIndex = completionSelections.length === 0
       ? -1
@@ -1194,6 +1226,31 @@ export const InlineMediaComposer = forwardRef<InlineMediaComposerHandle, InlineM
       const groupsById = new Map<string, ComposerCompletionGroup>();
       let selectableIndex = 0;
       for (const selection of completionSelections) {
+        if (selection.type === "host") {
+          const reference = selection.reference;
+          const session = reference.kind === "session";
+          const groupId = session ? "host:sessions" : "host:files";
+          const groupLabel = session
+            ? text("DSH 对话", "DSH conversations")
+            : text("DSH 文件与目录", "DSH files & folders");
+          let group = groupsById.get(groupId);
+          if (!group) {
+            group = { id: groupId, label: groupLabel, options: [] };
+            groups.push(group);
+            groupsById.set(groupId, group);
+          }
+          group.options.push({
+            id: completionSelectionId(selection),
+            label: reference.label,
+            description: session
+              ? text("引用该会话的上下文", "Reference this conversation as context")
+              : reference.mention,
+            icon: session ? "conversation" : "project",
+            selectableIndex,
+          });
+          selectableIndex += 1;
+          continue;
+        }
         const candidate = selection.type === "candidate" ? selection.candidate : null;
         const groupId = candidate ? `codex:${candidate.group}` : "taskboard:issues";
         const groupLabel = candidate?.group ?? text("Taskboard 议题", "Taskboard issues");
@@ -1523,11 +1580,14 @@ export const InlineMediaComposer = forwardRef<InlineMediaComposerHandle, InlineM
         || freshQuery.trigger !== query.trigger
       ) return;
 
-      if (selection.type === "candidate" && selection.candidate.kind === "slashAction") {
-        const insertedText = selection.candidate.selection?.type === "insertText"
-          ? selection.candidate.selection.text
+      const insertedText = selection.type === "host"
+        ? selection.reference.mention
+        : selection.type === "candidate" && selection.candidate.kind === "slashAction"
+          ? selection.candidate.selection?.type === "insertText"
+            ? selection.candidate.selection.text
+            : null
           : null;
-        if (insertedText === null) return;
+      if (insertedText !== null) {
         const insertion = createInlineMediaSegments(insertedText, referenceTasksRef.current);
         populateAtomSegments(atomSegments.current, insertion);
         const insertionDocument = editorDocumentFromSegments(insertion);
@@ -1554,7 +1614,7 @@ export const InlineMediaComposer = forwardRef<InlineMediaComposerHandle, InlineM
           projectId: task.projectId,
           taskId: task.id,
         };
-      } else {
+      } else if (selection.type === "candidate") {
         const candidate = selection.candidate;
         if (candidate.kind === "slashAction") return;
         const persistence = candidate.persistence;
@@ -1570,6 +1630,7 @@ export const InlineMediaComposer = forwardRef<InlineMediaComposerHandle, InlineM
         ) return;
         reference = parsedReference;
       }
+      if (!reference) return;
 
       atomSegments.current.set(reference.id, reference);
       const atomNode = editorAtomNode(reference);
@@ -1813,6 +1874,23 @@ export const InlineMediaComposer = forwardRef<InlineMediaComposerHandle, InlineM
       completionQuery?.trigger,
       text,
     ]);
+
+    useEffect(() => {
+      const request = hostReferenceRequestRef.current;
+      if (!request || completionQuery?.trigger !== "@") {
+        setHostReferenceGroups(null);
+        return;
+      }
+      let cancelled = false;
+      void request(completionQuery.query).then((groups) => {
+        if (!cancelled) setHostReferenceGroups(groups);
+      }, () => {
+        if (!cancelled) setHostReferenceGroups(null);
+      });
+      return () => {
+        cancelled = true;
+      };
+    }, [completionQuery?.query, completionQuery?.trigger]);
 
     useImperativeHandle(ref, () => ({
       focus() {

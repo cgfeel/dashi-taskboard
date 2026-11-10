@@ -86,6 +86,7 @@ import {
   type NewTaskCreateOptions,
   type NewTaskEditorDraft,
 } from "./components/TaskEditor";
+import type { HostReferenceCandidateGroups } from "./components/InlineMediaComposer";
 import { TaskFilterMenu, type TaskSort } from "./components/TaskFilterMenu";
 import {
   PROJECT_BOARD_DISPLAY_SETTINGS_KEY_PREFIX,
@@ -876,6 +877,10 @@ export function App() {
   const [automationCatalogError, setAutomationCatalogError] = useState<string | null>(null);
   const projectsRequestRef = useRef(0);
   const workspaceProjectSyncRef = useRef<string | null>(null);
+  const hostReferenceRequestsRef = useRef(new Map<
+    string,
+    (groups: HostReferenceCandidateGroups) => void
+  >());
   const tasksRequestRef = useRef(0);
   const tasksRef = useRef<Task[]>([]);
   const undoSequenceRef = useRef(0);
@@ -938,6 +943,25 @@ export function App() {
       return next;
     });
   }, []);
+
+  const requestHostReferenceCandidates = useCallback((query: string) => (
+    new Promise<HostReferenceCandidateGroups>((resolve) => {
+      const requestId = `host-reference-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const timeout = window.setTimeout(() => {
+        hostReferenceRequestsRef.current.delete(requestId);
+        resolve({ files: [], sessions: [] });
+      }, 4_000);
+      hostReferenceRequestsRef.current.set(requestId, (groups) => {
+        window.clearTimeout(timeout);
+        hostReferenceRequestsRef.current.delete(requestId);
+        resolve(groups);
+      });
+      postEmbeddedHostMessage({
+        type: "taskboard:reference-candidates",
+        payload: { requestId, query },
+      });
+    })
+  ), []);
 
   const rememberProjectOpen = useCallback((projectId: string) => {
     setRecentProjectIds((current) => {
@@ -1866,6 +1890,26 @@ export function App() {
 
       if (message.type === "taskboard:theme" && isTheme(message.theme)) {
         setTheme(message.theme);
+        return;
+      }
+
+      if (message.type === "taskboard:reference-candidates-response" && message.payload) {
+        const payload = message.payload as {
+          requestId?: unknown;
+          files?: unknown;
+          sessions?: unknown;
+        };
+        if (typeof payload.requestId !== "string") return;
+        const pending = hostReferenceRequestsRef.current.get(payload.requestId);
+        if (!pending) return;
+        pending({
+          files: Array.isArray(payload.files)
+            ? payload.files as HostReferenceCandidateGroups["files"]
+            : [],
+          sessions: Array.isArray(payload.sessions)
+            ? payload.sessions as HostReferenceCandidateGroups["sessions"]
+            : [],
+        });
         return;
       }
 
@@ -3209,6 +3253,9 @@ export function App() {
       `[$manage-taskboard](${manageTaskboardSkillPath}) 议题 ID：${task.identifier}`,
       `[$manage-taskboard](${manageTaskboardSkillPath}) Issue ID: ${task.identifier}`,
     );
+    const referenceMentions = [
+      ...new Set(task.description.match(/@\[[^\]]*\]\(dsh-session:[^)]+\)/g) ?? []),
+    ];
 
     if (
       !projectless
@@ -3284,6 +3331,7 @@ export function App() {
         codexProjectWorkspacePath: codexProjectContext?.workspacePath,
         workspacePath,
         ...(resumeThreadId ? { threadId: resumeThreadId } : {}),
+        ...(referenceMentions.length > 0 ? { references: referenceMentions } : {}),
       },
     });
   }
@@ -4321,6 +4369,9 @@ export function App() {
           currentUser={currentUser}
           developmentScan={developmentScan}
           developmentScanLoading={developmentScanLoading}
+          onHostReferenceCandidates={embedded && host === "deepseek-harness"
+            ? requestHostReferenceCandidates
+            : undefined}
           onCreateLabel={(label) => persistProjectLabel(label, editorProjectId ?? selectedProjectId)}
           onCancel={(draft) => {
             setNewTaskDraft(draft ? {

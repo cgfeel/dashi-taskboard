@@ -151,7 +151,11 @@ uses it:
   error instead of failing silently;
 - every delivered issue instruction carries the host rule: when the issue needs user
   confirmation, move it to `blocked` and comment what is being waited on (only delivered
-  work goes to `in_review`).
+  work goes to `in_review`);
+- the issue composer's `@` menu adds two separate context groups — **DSH files & folders**
+  and **DSH conversations** — fed by the plugin bridge; selected conversation mentions are
+  replayed into the execution prompt as referenced context, while file mentions stay as
+  readable paths for the agent.
 
 ## Verify the integration
 

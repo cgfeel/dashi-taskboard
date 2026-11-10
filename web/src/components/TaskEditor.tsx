@@ -200,6 +200,15 @@ export function TaskEditor({
   const [error, setError] = useState<TaskEditorError | null>(null);
   const [attachmentError, setAttachmentError] = useState<TaskEditorError | null>(null);
 
+  useEffect(() => {
+    if (developmentScanLoading || !developmentScan.workspacePath) return;
+    const currentWorktree = developmentScan.contexts.find(
+      (context) => context.type === "worktree" && context.path === developmentScan.workspacePath,
+    );
+    if (!currentWorktree) return;
+    setDevelopmentContext((current) => current ?? currentWorktree);
+  }, [developmentScan.contexts, developmentScan.workspacePath, developmentScanLoading]);
+
   const developmentOptions = useMemo(() => {
     const options = [...developmentScan.contexts];
     if (developmentContext && !options.some((option) => contextValue(option) === contextValue(developmentContext))) {

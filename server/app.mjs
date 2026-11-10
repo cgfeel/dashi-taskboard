@@ -1277,16 +1277,47 @@ async function parseWorktrees(output) {
   return contexts;
 }
 
-async function scanDevelopmentContexts(workspacePath, processEnv = process.env) {
-  if (!workspacePath) return { workspacePath: null, contexts: [] };
-  const environment = withoutTaskboardLauncherEnvironment(processEnv);
+async function resolveGitRoot(workspacePath, environment) {
   try {
-    const rootResult = await execFileAsync("git", ["-C", workspacePath, "rev-parse", "--show-toplevel"], {
+    const result = await execFileAsync("git", ["-C", workspacePath, "rev-parse", "--show-toplevel"], {
       env: environment,
       timeout: 4_000,
       maxBuffer: 1024 * 1024,
     });
-    const root = rootResult.stdout.trim();
+    return result.stdout.trim();
+  } catch {
+    // The host may pass a parent directory that is not itself a repository;
+    // fall back to a repository in one of its immediate subdirectories.
+    let entries;
+    try {
+      entries = await readdir(workspacePath, { withFileTypes: true });
+    } catch {
+      return null;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const candidate = path.join(workspacePath, entry.name);
+      try {
+        const result = await execFileAsync("git", ["-C", candidate, "rev-parse", "--show-toplevel"], {
+          env: environment,
+          timeout: 4_000,
+          maxBuffer: 1024 * 1024,
+        });
+        return result.stdout.trim();
+      } catch {
+        // Try the next subdirectory.
+      }
+    }
+    return null;
+  }
+}
+
+async function scanDevelopmentContexts(workspacePath, processEnv = process.env) {
+  if (!workspacePath) return { workspacePath: null, contexts: [] };
+  const environment = withoutTaskboardLauncherEnvironment(processEnv);
+  try {
+    const root = await resolveGitRoot(workspacePath, environment);
+    if (!root) return { workspacePath, contexts: [] };
     const [branchesResult, worktreesResult] = await Promise.all([
       execFileAsync("git", ["-C", root, "for-each-ref", "--format=%(refname:short)", "refs/heads"], {
         env: environment,

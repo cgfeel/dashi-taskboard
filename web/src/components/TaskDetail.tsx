@@ -1666,13 +1666,18 @@ export function TaskDetail({
               <button
                 className="detail-open-thread-action"
                 type="button"
-                disabled={openingThread}
+                disabled={openingThread || (currentTask.status !== "todo" && currentTask.status !== "in_progress")}
+                title={currentTask.status !== "todo" && currentTask.status !== "in_progress"
+                  ? text("只有“等待认领/处理中”的议题可以执行", "Only To do or In progress issues can run")
+                  : undefined}
                 onClick={() => onOpenInThread(currentTask)}
               >
                 <NewConversationIcon color="currentColor" />
                 <span>{openingThread
                   ? text("正在打开…", "Opening…")
-                  : text("在新对话打开", "Open in new conversation")}</span>
+                  : currentTask.threadBinding || currentTask.threadId || currentTask.legacyLocalThreadId
+                    ? text("继续执行", "Continue")
+                    : text("在新对话打开", "Open in new conversation")}</span>
               </button>
               {currentTask.externalUrl && (
                 <a

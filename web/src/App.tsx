@@ -317,6 +317,26 @@ const PROJECT_CODEX_IDENTITIES_KEY = "taskboard.projectCodexIdentities.v1";
 const PROJECT_AUTOMATIONS_KEY = "taskboard.projectAutomations.v1";
 const ISSUE_READ_KEY_PREFIX = "taskboard.issue-read.v1";
 const FIRST_USE_COMPLETE_KEY = "taskboard.first-use-complete.v1";
+const WORKSPACE_PROJECT_ID_PREFIX = "ws-";
+
+/** Last path segment, used as the on-demand project name for a host workspace. */
+function workspacePathBasename(workspacePath: string): string {
+  return workspacePath.split(/[\\/]/).filter(Boolean).at(-1) ?? workspacePath;
+}
+
+/**
+ * Deterministic project id for a host workspace path: every panel open for the
+ * same directory resolves to one project instead of racing to create more.
+ */
+function workspaceProjectId(workspacePath: string): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < workspacePath.length; index += 1) {
+    hash ^= workspacePath.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return `${WORKSPACE_PROJECT_ID_PREFIX}${hash.toString(16).padStart(8, "0")}`;
+}
+
 function issueReadStorageKey(mode: string, task: Pick<Task, "id" | "projectId">) {
   return `${ISSUE_READ_KEY_PREFIX}:${mode}:${task.projectId}:${task.id}`;
 }
@@ -732,6 +752,7 @@ export function App() {
   const query = useMemo(() => new URL(document.baseURI).searchParams, []);
   const host = query.get("host");
   const embedded = host === "codex" || host === "deepseek-harness";
+  const bootWorkspacePath = query.get("workspacePath")?.trim() || undefined;
   const undoShortcut = navigator.userAgent.includes("Macintosh") ? "⌘Z" : "Ctrl+Z";
   const [theme, setTheme] = useState<Theme>(getInitialTheme);
   const [hostContext, setHostContext] = useState<HostContext | null>(null);
@@ -854,6 +875,7 @@ export function App() {
   const [automationCatalogLoading, setAutomationCatalogLoading] = useState(false);
   const [automationCatalogError, setAutomationCatalogError] = useState<string | null>(null);
   const projectsRequestRef = useRef(0);
+  const workspaceProjectSyncRef = useRef<string | null>(null);
   const tasksRequestRef = useRef(0);
   const tasksRef = useRef<Task[]>([]);
   const undoSequenceRef = useRef(0);
@@ -1991,6 +2013,69 @@ export function App() {
     return () => controller.abort();
   }, [loadProjectList]);
 
+  // Embedded host mode: bind the board to the host workspace's project so an
+  // issue created here is filed under the repository it belongs to instead of
+  // whichever project happened to be open last. The project is created on
+  // demand with its workspacePath and reused by later panel opens (the id is
+  // derived from the path, so parallel opens converge on the same row).
+  useEffect(() => {
+    if (host !== "deepseek-harness" || !bootWorkspacePath) return;
+    if (query.get("project")) return;
+    if (projects.length === 0) return;
+    if (workspaceProjectSyncRef.current === bootWorkspacePath) return;
+    workspaceProjectSyncRef.current = bootWorkspacePath;
+    const existing = projects.find((project) => (
+      project.id !== GLOBAL_PROJECT_ID
+      && (deviceWorkspacePaths[project.id] ?? project.workspacePath) === bootWorkspacePath
+    ));
+    if (existing) {
+      if (existing.id !== selectedProjectId) changeProject(existing.id);
+      return;
+    }
+    const projectId = workspaceProjectId(bootWorkspacePath);
+    const known = projects.find((project) => project.id === projectId);
+    if (known) {
+      changeProject(known.id);
+      return;
+    }
+    void (async () => {
+      try {
+        const project = await createProjectRequest({
+          id: projectId,
+          name: workspacePathBasename(bootWorkspacePath),
+          workspacePath: bootWorkspacePath,
+        });
+        setProjects((current) => (
+          current.some((candidate) => candidate.id === project.id) ? current : [...current, project]
+        ));
+        changeProject(project.id);
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 409) {
+          try {
+            const nextProjects = await listProjects();
+            setProjects(nextProjects);
+            if (nextProjects.some((candidate) => candidate.id === projectId)) {
+              changeProject(projectId);
+            }
+          } catch {
+            // Keep the previous selection; the board still works.
+          }
+          return;
+        }
+        setActionError(errorMessage(error));
+      }
+    })();
+    // `changeProject`/`setProjects` are stable intents of this effect; the ref
+    // above prevents re-entry, so they can stay out of the dependency list.
+  }, [
+    bootWorkspacePath,
+    deviceWorkspacePaths,
+    host,
+    projects,
+    query,
+    selectedProjectId,
+  ]);
+
   const refreshProjectList = useCallback(async () => {
     const requestId = ++projectsRequestRef.current;
     setProjectLoadError((current) => (
@@ -2102,11 +2187,11 @@ export function App() {
     const codexThreadId = hostContext?.threadId
       ?? (isAllProjects ? contextMenuTask?.threadId : detailTask?.threadId)
       ?? undefined;
-    const workspacePath = isAllProjects
+    const workspacePath = bootWorkspacePath ?? (isAllProjects
       ? developmentEditorProjectId
         ? deviceWorkspacePaths[developmentEditorProjectId]
         : contextMenuWorkspacePath
-      : selectedDeviceWorkspacePath;
+      : selectedDeviceWorkspacePath);
     setDevelopmentScan({ workspacePath: workspacePath ?? null, contexts: [] });
     setDevelopmentScanLoading(true);
     void listDevelopmentContexts(
@@ -2130,6 +2215,7 @@ export function App() {
       });
     return () => controller.abort();
   }, [
+    bootWorkspacePath,
     contextMenuTask?.projectId,
     contextMenuTask?.threadId,
     contextMenuWorkspacePath,
@@ -2893,13 +2979,46 @@ export function App() {
     }
   }
 
-  async function copyText(content: string, message: string) {
-    try {
-      await navigator.clipboard.writeText(content);
-      setAnnouncement(message);
-    } catch {
-      setActionError(text("无法写入剪贴板。", "Could not write to the clipboard."));
+  function copyText(content: string, message: string) {
+    const announce = () => setAnnouncement(message);
+    const fail = () => setActionError(text("无法写入剪贴板。", "Could not write to the clipboard."));
+
+    const copyWithExecCommand = () => {
+      try {
+        const textarea = document.createElement("textarea");
+        textarea.value = content;
+        textarea.setAttribute("readonly", "");
+        textarea.style.position = "fixed";
+        textarea.style.top = "-9999px";
+        textarea.style.left = "-9999px";
+        document.body.appendChild(textarea);
+        const active = document.activeElement;
+        textarea.focus();
+        textarea.select();
+        textarea.setSelectionRange(0, content.length);
+        const ok = document.execCommand("copy");
+        document.body.removeChild(textarea);
+        if (active instanceof HTMLElement) active.focus();
+        return ok;
+      } catch {
+        return false;
+      }
+    };
+
+    // Use the synchronous legacy path first: it runs inside the click's
+    // user-activation window and works in cross-origin iframes where the async
+    // Clipboard API is blocked by Permissions Policy.
+    if (copyWithExecCommand()) {
+      announce();
+      return;
     }
+
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(content).then(announce, fail);
+      return;
+    }
+
+    fail();
   }
 
   function codexProjectContextForTaskProject(taskboardProjectId: string) {
@@ -3038,6 +3157,13 @@ export function App() {
   }
 
   async function openTaskInThread(task: Task) {
+    // Running an agent only makes sense for claimable work; review/done/canceled
+    // items advance by status instead.
+    if (task.status !== "todo" && task.status !== "in_progress") return;
+    const resumeThreadId = task.threadBinding?.threadId
+      ?? task.legacyLocalThreadId
+      ?? task.threadId
+      ?? undefined;
     const standalone = !embedded || window.parent === window;
     const projectless = task.projectId === GLOBAL_PROJECT_ID;
     const taskboardProject = projects.find((project) => project.id === task.projectId);
@@ -3134,9 +3260,11 @@ export function App() {
         ));
         return;
       }
-      const deepLink = new URL("codex://threads/new");
-      if (workspacePath) deepLink.searchParams.set("path", workspacePath);
-      deepLink.searchParams.set("prompt", embeddedInstruction);
+      const deepLink = new URL(resumeThreadId
+        ? `codex://threads/${encodeURIComponent(resumeThreadId)}`
+        : "codex://threads/new");
+      if (!resumeThreadId && workspacePath) deepLink.searchParams.set("path", workspacePath);
+      if (!resumeThreadId) deepLink.searchParams.set("prompt", embeddedInstruction);
       window.location.assign(deepLink.toString());
       return;
     }
@@ -3155,6 +3283,7 @@ export function App() {
         codexHostId: codexProjectContext?.codexHostId ?? "local",
         codexProjectWorkspacePath: codexProjectContext?.workspacePath,
         workspacePath,
+        ...(resumeThreadId ? { threadId: resumeThreadId } : {}),
       },
     });
   }

@@ -9,6 +9,22 @@ window.__ModuleLoader__.load({
     const ROUTE = "/integrations/codex-taskboard";
     const PANEL_ID = "dsh-codex-taskboard-panel";
     const STYLE_ID = "dsh-codex-taskboard-style";
+    // Appended to every issue instruction this host delivers, so a mid-turn
+    // question is visible on the board as Blocked instead of polluting the
+    // review column (In review means "a delivery is waiting for acceptance").
+    const HOST_INSTRUCTION_RULE = [
+      "Host rule (deepseek-harness taskboard bridge):",
+      "When this issue needs the user to confirm something — an answer to a question, an approval, or a plan review —",
+      "move the issue to `blocked` with taskctl and post a comment stating exactly what you are waiting for,",
+      "then end your turn. Only move it to `in_review` when a full round of work is delivered for acceptance.",
+    ].join("\n");
+
+    function withHostInstructionRule(instruction) {
+      const text = typeof instruction === "string" ? instruction.trim() : "";
+      if (!text) return text;
+      return `${text}\n\n${HOST_INSTRUCTION_RULE}`;
+    }
+
     const CSS = `
 .dsh-codex-taskboard-trigger{box-sizing:border-box;display:flex;align-items:center;gap:8px;width:calc(100% + 8px);height:34px;margin:4px -4px;padding:6px 2px 6px 10px;border:0;border-radius:12px;background:transparent;color:var(--dsw-alias-label-primary);cursor:pointer;font:inherit;overflow:hidden}
 .dsh-codex-taskboard-trigger:hover{background:var(--dsw-alias-interactive-bg-hover)}
@@ -21,6 +37,20 @@ window.__ModuleLoader__.load({
 .dsh-codex-taskboard-action:hover{background:var(--dsw-alias-interactive-bg-hover)}
 .dsh-codex-taskboard-frame{flex:1;min-height:0;border:0;background:#fff}
 `;
+
+    // Panel instances register their close action here so host-initiated
+    // navigation (run/continue an issue, open its conversation) can dismiss the
+    // overlay and let the DSH main view take over.
+    const panelClosers = new Set();
+    function closeTaskboardPanels() {
+      for (const close of [...panelClosers]) {
+        try {
+          close();
+        } catch (error) {
+          console.error("[codex-taskboard] failed to close the panel:", error);
+        }
+      }
+    }
 
     function centerColumnBox() {
       for (const element of document.querySelectorAll("*")) {
@@ -70,9 +100,34 @@ window.__ModuleLoader__.load({
       );
     }
 
-    function TaskboardPanel({ onClose }) {
+    function readWorkspacePath(ctx) {
+      const sessions = ctx?.sessions ?? ctx?.get?.("sessions");
+      const snapshot = sessions?.list?.getSnapshot?.();
+      if (!snapshot) return "";
+      // SessionListState has no `current` field: the main Conversation is the
+      // row this client retains under the `mainView` source.
+      const summary = Object.values(snapshot.byId ?? {}).find(
+        (candidate) => (candidate?.retainedBy?.mainView ?? 0) > 0,
+      );
+      return typeof summary?.cwd === "string" ? summary.cwd : "";
+    }
+
+    function useWorkspacePath(ctx) {
+      const [workspacePath, setWorkspacePath] = useState(() => readWorkspacePath(ctx));
+      useEffect(() => {
+        const list = (ctx?.sessions ?? ctx?.get?.("sessions"))?.list;
+        if (!list?.subscribe) return;
+        const update = () => setWorkspacePath(readWorkspacePath(ctx));
+        update();
+        return list.subscribe(update);
+      }, [ctx]);
+      return workspacePath;
+    }
+
+    function TaskboardPanel({ onClose, workspacePath }) {
       const box = useCenterColumnBox();
       const [generation, setGeneration] = useState(0);
+      const query = `refresh=${generation}${workspacePath ? `&workspacePath=${encodeURIComponent(workspacePath)}` : ""}`;
       return React.createElement(
         "aside",
         {
@@ -105,16 +160,25 @@ window.__ModuleLoader__.load({
           ),
         ),
         React.createElement("iframe", {
-          key: generation,
+          key: `${generation}:${workspacePath}`,
           className: "dsh-codex-taskboard-frame",
-          src: `${ROUTE}?refresh=${generation}`,
+          src: `${ROUTE}?${query}`,
           title: "Codex Taskboard",
+          allow: "clipboard-write",
         }),
       );
     }
 
-    function TaskboardEntry({ wide }) {
+    function TaskboardEntry({ wide, ctx }) {
       const [open, setOpen] = useState(false);
+      const workspacePath = useWorkspacePath(ctx);
+      useEffect(() => {
+        // Host-initiated navigation (run an issue / open its conversation) takes
+        // over the main view, so the overlay panel must get out of the way.
+        const close = () => setOpen(false);
+        panelClosers.add(close);
+        return () => panelClosers.delete(close);
+      }, []);
       return React.createElement(
         React.Fragment,
         null,
@@ -132,11 +196,11 @@ window.__ModuleLoader__.load({
           React.createElement(ChecklistIcon),
           wide && React.createElement("span", { className: "dsh-codex-taskboard-label" }, "任务面板"),
         ),
-        open && React.createElement(TaskboardPanel, { onClose: () => setOpen(false) }),
+        open && React.createElement(TaskboardPanel, { onClose: () => setOpen(false), workspacePath }),
       );
     }
 
-    const inject = ["slots"];
+    const inject = ["slots", "sessions", "workspaces"];
 
     function apply(ctx) {
       ctx.effect(() => {
@@ -152,7 +216,160 @@ window.__ModuleLoader__.load({
         name: "sidebar.footer.action",
         id: "codex-taskboard",
         order: 0,
-      }, TaskboardEntry));
+      }, (props) => React.createElement(TaskboardEntry, { ...props, ctx })));
+
+      const sessions = ctx.get("sessions");
+      const workspaces = ctx.get("workspaces");
+
+      const uiWorkspaceOf = () => {
+        try {
+          return ctx.get?.("uiWorkspace");
+        } catch {
+          return undefined;
+        }
+      };
+
+      // Navigation retains the new Session synchronously, but its shared binding
+      // can still be settling; wait briefly before seeding the issue prompt.
+      const waitForSessionFace = async (sessionId, timeoutMs = 3_000) => {
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() <= deadline) {
+          const face = sessions?.binding?.(sessionId)?.session;
+          if (face) return face;
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        return undefined;
+      };
+
+      const seedIssueInstruction = async (sessionId, instruction) => {
+        if (!instruction) return;
+        const face = await waitForSessionFace(sessionId);
+        if (!face) throw new Error(`DSH session is not ready: ${sessionId}`);
+        await face.open();
+        const result = await face.prompt([{ type: "text", text: instruction }], "queue");
+        if (result && result.ok === false) {
+          throw new Error(result.error?.message ?? "DSH rejected the issue instruction.");
+        }
+      };
+
+      const openTaskboardSession = async (workspacePath, instruction) => {
+        let workspaceId = workspaces?.list?.getSnapshot?.()?.items
+          ?.find((item) => item.path === workspacePath)?.workspaceId;
+        if (!workspaceId && workspaces?.create) {
+          try {
+            const created = await workspaces.create({ path: workspacePath });
+            workspaceId = created?.workspaceId;
+          } catch {
+            workspaceId = undefined;
+          }
+        }
+        const sessionId = workspaceId
+          ? await sessions.create({ workspaceId })
+          : await sessions.create({ cwd: workspacePath });
+        const uiWorkspace = uiWorkspaceOf();
+        if (uiWorkspace?.openSession) uiWorkspace.openSession(sessionId);
+        await seedIssueInstruction(sessionId, instruction);
+        return sessionId;
+      };
+
+      // A bound issue continues in the conversation that owns it: reopen that
+      // Session and re-send the issue instruction so the agent re-reads it.
+      const resumeTaskboardSession = async (threadId, instruction) => {
+        const uiWorkspace = uiWorkspaceOf();
+        if (typeof uiWorkspace?.openSession !== "function") {
+          throw new Error("DSH conversation navigation is unavailable.");
+        }
+        const known = sessions?.list?.getSnapshot?.()?.byId?.[threadId];
+        if (!known) throw new Error(`DSH session not found: ${threadId}`);
+        uiWorkspace.openSession(threadId);
+        await seedIssueInstruction(threadId, instruction);
+        return threadId;
+      };
+
+      const handleTaskboardMessage = async (event) => {
+        const message = event.data;
+        if (!message || typeof message !== "object") return;
+        const reply = (type, payload) => {
+          if (event.source && typeof event.source.postMessage === "function") {
+            event.source.postMessage({ type, ...(payload ? { payload } : {}) }, "*");
+          }
+        };
+
+        // Conversation bubble / comment "View conversation": reopen the bound
+        // Session for reading only; the issue prompt is not re-sent.
+        if (message.type === "taskboard:open-thread") {
+          const threadId = typeof message.payload?.threadId === "string"
+            ? message.payload.threadId.trim()
+            : "";
+          if (!threadId) {
+            reply("taskboard:thread-open-error", { error: "The conversation has no DSH session id." });
+            return;
+          }
+          const uiWorkspace = uiWorkspaceOf();
+          if (typeof uiWorkspace?.openSession !== "function") {
+            reply("taskboard:thread-open-error", { error: "DSH conversation navigation is unavailable." });
+            return;
+          }
+          if (!sessions?.list?.getSnapshot?.()?.byId?.[threadId]) {
+            reply("taskboard:thread-open-error", { error: `DSH session not found: ${threadId}` });
+            return;
+          }
+          try {
+            uiWorkspace.openSession(threadId);
+            closeTaskboardPanels();
+          } catch (error) {
+            reply("taskboard:thread-open-error", {
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+          return;
+        }
+
+        if (message.type !== "taskboard:create-thread") return;
+        const workspacePath = typeof message.payload?.workspacePath === "string"
+          ? message.payload.workspacePath
+          : "";
+        const instruction = withHostInstructionRule(
+          typeof message.payload?.instruction === "string"
+            ? message.payload.instruction
+            : "",
+        );
+        const boundThreadId = typeof message.payload?.threadId === "string"
+          ? message.payload.threadId.trim()
+          : "";
+        if (boundThreadId) {
+          try {
+            await resumeTaskboardSession(boundThreadId, instruction);
+            reply("taskboard:thread-prepared", {});
+            closeTaskboardPanels();
+          } catch (error) {
+            console.error("[codex-taskboard] failed to resume the bound session:", error);
+            reply("taskboard:thread-create-error", {
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+          return;
+        }
+        if (!workspacePath) {
+          reply("taskboard:thread-create-error", { error: "No workspace path" });
+          return;
+        }
+        try {
+          await openTaskboardSession(workspacePath, instruction);
+          reply("taskboard:thread-prepared", {});
+          closeTaskboardPanels();
+        } catch (error) {
+          console.error("[codex-taskboard] failed to open a new session:", error);
+          reply("taskboard:thread-create-error", {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      };
+
+      ctx.effect(() => {
+        window.addEventListener("message", handleTaskboardMessage);
+        return () => window.removeEventListener("message", handleTaskboardMessage);
+      }, "codex-taskboard: taskboard messages");
     }
 
     exports.apply = apply;

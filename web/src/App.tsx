@@ -949,6 +949,7 @@ export function App() {
       const requestId = `host-reference-${Date.now()}-${Math.random().toString(36).slice(2)}`;
       const timeout = window.setTimeout(() => {
         hostReferenceRequestsRef.current.delete(requestId);
+        console.warn("[taskboard] DSH reference candidates timed out");
         resolve({ files: [], sessions: [] });
       }, 4_000);
       hostReferenceRequestsRef.current.set(requestId, (groups) => {

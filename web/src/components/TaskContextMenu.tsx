@@ -415,9 +415,11 @@ export function TaskContextMenu({
           )}
         </MenuItem>
         <MenuItem
-          label={text("在新对话打开", "Open in new conversation")}
+          label={task.threadBinding || task.threadId || task.legacyLocalThreadId
+            ? text("继续执行", "Continue")
+            : text("在新对话打开", "Open in new conversation")}
           icon={<NewConversationIcon color="currentColor" size={16} />}
-          disabled={openInThreadDisabled}
+          disabled={openInThreadDisabled || (task.status !== "todo" && task.status !== "in_progress")}
           onPointerEnter={closeSubmenu}
           onClick={() => closeThen(() => onOpenInThread(task))}
         />
